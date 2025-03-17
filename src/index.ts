@@ -1,10 +1,3 @@
-/**
- * @name RevengeDiscordStickers
- * @version 1.0.0
- * @description Replaces ezgif picker with Discord's sticker picker
- * @author Claude
- */
-
 import { Plugin } from "@revenge-mod/plugin";
 import { findByProps, findByStoreName } from "@revenge-mod/metro";
 import { after, before } from "@revenge-mod/patcher";
