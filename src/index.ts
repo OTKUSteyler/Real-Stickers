@@ -1,11 +1,14 @@
-import { Plugin } from "@revenge-mod/plugin";
-import { findByProps, findByStoreName } from "@revenge-mod/metro";
-import { after, before } from "@revenge-mod/patcher";
-import { React } from "@revenge-mod/metro/common";
-import { getAssetIDByName } from "@revenge-mod/ui/assets";
-import { findInReactTree } from "@revenge-mod/utils";
-import { showToast } from "@revenge-mod/ui/toasts";
+import { logger, registerCommand } from "@vendetta";
+import { findByProps, findByStoreName } from "@vendetta/metro";
+import { React } from "@vendetta/metro/common";
+import { after, before } from "@vendetta/patcher";
+import { getAssetIDByName } from "@vendetta/ui/assets";
+import { showToast } from "@vendetta/ui/toasts";
+import { findInReactTree } from "@vendetta/utils";
+import { ApplicationCommandType, ApplicationCommandOptionType } from "@vendetta/types";
+import Settings from "./components/Settings";
 
+// Interfaces
 interface Sticker {
   id: string;
   name: string;
@@ -18,149 +21,217 @@ interface Sticker {
   type?: number;
 }
 
-interface StickerStore {
-  getStickerById: (id: string) => Sticker;
-  getAllStickers: () => Sticker[];
-  getStickersByGuildId: (guildId: string) => Sticker[];
-}
+let patches = [];
+let stickerCache: Record<string, Sticker> = {};
 
-interface StickerUtils {
-  fetchStickers: () => Promise<Sticker[]>;
-  favoriteSticker: (stickerId: string) => void;
-}
+// Store and component references
+const StickerStore = findByStoreName("StickersStore") || findByProps("getStickerById", "getAllStickers");
+const MessageActions = findByProps("sendMessage", "sendStickers");
+const StickerUtils = findByProps("fetchStickers", "favoriteSticker");
+const StickerPermissionUtils = findByProps("canUseSticker", "isStickerPremiumLocked");
+const StickerPickerComponents = findByProps("StickerPicker");
 
-interface StickerPermissionUtils {
-  canUseSticker: (sticker: Sticker) => boolean;
-  isStickerPremiumLocked: (sticker: Sticker) => boolean;
-}
+const pluginName = "RevengeDiscordStickers";
 
-interface MessageActions {
-  sendSticker: (channelId: string, stickerId: string, messageContent?: object) => void;
-  sendMessage: (channelId: string, message: object) => void;
-}
-
-interface StickerPickerComponents {
-  StickerPicker: {
-    default: React.ComponentType<any>;
-  };
-  openStickerPicker?: (channelId: string) => void;
-}
-
-export default class RevengeDiscordStickers extends Plugin {
-  private patches: Array<() => void> = [];
-  private stickerCache: Record<string, Sticker> = {};
-  
-  private StickerStore: StickerStore;
-  private MessageActions: MessageActions;
-  private StickerUtils: StickerUtils;
-  private StickerPermissionUtils: StickerPermissionUtils;
-  private StickerPickerComponents: StickerPickerComponents;
-
-  start() {
-    console.log("[RevengeDiscordStickers] Loading...");
-    
-    // Initialize stores and components
-    this.StickerStore = findByStoreName("StickersStore") || findByProps("getStickerById");
-    this.MessageActions = findByProps("sendMessage", "sendStickers");
-    this.StickerUtils = findByProps("fetchStickers", "favoriteSticker");
-    this.StickerPermissionUtils = findByProps("canUseSticker", "isStickerPremiumLocked");
-    this.StickerPickerComponents = findByProps("StickerPicker");
+export default {
+  settings: Settings,
+  onLoad: () => {
+    logger.log(`[${pluginName}] Loading...`);
     
     // Patch Discord's sticker picker to allow all stickers
-    this.patchStickerPicker();
+    patchStickerPicker();
     
     // Patch sticker sending function
-    this.patchStickerSending();
+    patchStickerSending();
     
     // Replace ezgif picker with Discord's sticker picker
-    this.replaceEzgifPicker();
+    replaceEzgifPicker();
     
-    // Fetch stickers
-    this.fetchAllStickers();
+    // Fetch stickers for caching
+    fetchAllStickers();
     
-    showToast("RevengeDiscordStickers enabled");
-    console.log("[RevengeDiscordStickers] Successfully loaded");
-  }
-
-  stop() {
-    console.log("[RevengeDiscordStickers] Unloading...");
-    for (const unpatch of this.patches) {
+    // Register command to toggle sticker UI
+    registerStickerCommand();
+    
+    showToast(`${pluginName} enabled`);
+    logger.log(`[${pluginName}] Successfully loaded`);
+  },
+  onUnload: () => {
+    logger.log(`[${pluginName}] Unloading...`);
+    
+    // Unpatch everything
+    for (const unpatch of patches) {
       unpatch();
     }
-    this.patches = [];
-    showToast("RevengeDiscordStickers disabled");
-    console.log("[RevengeDiscordStickers] Successfully unloaded");
+    
+    // Clear cache
+    stickerCache = {};
+    
+    showToast(`${pluginName} disabled`);
+    logger.log(`[${pluginName}] Successfully unloaded`);
+  }
+};
+
+function patchStickerPicker() {
+  if (!StickerPickerComponents?.StickerPicker) {
+    logger.error(`[${pluginName}] Could not find StickerPicker component`);
+    return;
   }
 
-  private patchStickerPicker(): void {
-    if (!this.StickerPickerComponents?.StickerPicker) {
-      console.error("[RevengeDiscordStickers] Could not find StickerPicker component");
-      return;
-    }
+  patches.push(
+    after("default", StickerPickerComponents.StickerPicker, (args, res) => {
+      const stickerItems = findInReactTree(res, n => n && n.stickers);
+      
+      if (stickerItems) {
+        // Add all available stickers regardless of permissions
+        const allStickers = StickerStore.getAllStickers();
+        stickerItems.stickers = allStickers;
+      }
+      
+      // Remove premium restrictions
+      const premiumRequired = findInReactTree(res, n => n && n.premiumRequired);
+      if (premiumRequired) {
+        premiumRequired.premiumRequired = false;
+      }
+      
+      return res;
+    })
+  );
+}
 
-    this.patches.push(
-      after("default", this.StickerPickerComponents.StickerPicker, (args: any, res: any) => {
-        const stickerItems = findInReactTree(res, (n: any) => n && n.stickers);
-        
-        if (stickerItems) {
-          // Add all available stickers regardless of permissions
-          const allStickers = this.StickerStore.getAllStickers();
-          stickerItems.stickers = allStickers;
-        }
-        
-        // Remove premium restrictions
-        const premiumRequired = findInReactTree(res, (n: any) => n && n.premiumRequired);
-        if (premiumRequired) {
-          premiumRequired.premiumRequired = false;
-        }
-        
-        return res;
+function patchStickerSending() {
+  // Override permission checks
+  if (StickerPermissionUtils) {
+    patches.push(
+      after("canUseSticker", StickerPermissionUtils, () => true)
+    );
+    
+    patches.push(
+      after("isStickerPremiumLocked", StickerPermissionUtils, () => false)
+    );
+  }
+  
+  // Patch the message sending function
+  if (MessageActions) {
+    patches.push(
+      before("sendSticker", MessageActions, ([channelId, stickerId, messageContent]) => {
+        logger.log(`[${pluginName}] Sending sticker ${stickerId} to channel ${channelId}`);
+        return [channelId, stickerId, messageContent];
       })
     );
   }
+}
 
-  private patchStickerSending(): void {
-    // Override permission checks
-    if (this.StickerPermissionUtils) {
-      this.patches.push(
-        after("canUseSticker", this.StickerPermissionUtils, () => true)
-      );
-      
-      this.patches.push(
-        after("isStickerPremiumLocked", this.StickerPermissionUtils, () => false)
-      );
-    }
-    
-    // Patch the message sending function
-    if (this.MessageActions) {
-      this.patches.push(
-        before("sendSticker", this.MessageActions, ([channelId, stickerId, messageContent]: [string, string, object]) => {
-          console.log(`[RevengeDiscordStickers] Sending sticker ${stickerId} to channel ${channelId}`);
-          return [channelId, stickerId, messageContent];
-        })
-      );
-    }
+function replaceEzgifPicker() {
+  // Find the chat input component
+  const ChatInput = findByProps("ChatInput")?.ChatInput;
+  if (!ChatInput) {
+    logger.error(`[${pluginName}] Could not find ChatInput component`);
+    return;
   }
-
-  private replaceEzgifPicker(): void {
-    // Find the chat input component
-    const ChatInput = findByProps("ChatInput")?.ChatInput;
-    if (!ChatInput) {
-      console.error("[RevengeDiscordStickers] Could not find ChatInput component");
-      return;
-    }
-    
-    // Find the ezgif button or GIF button
-    this.patches.push(
-      after("default", ChatInput, (args: any, res: any) => {
-        const buttons = findInReactTree(res, (n: any) => n && n.type && n.type.name === "ChatInputButtons");
+  
+  // Find the ezgif button or GIF button
+  patches.push(
+    after("default", ChatInput, (args, res) => {
+      const buttons = findInReactTree(res, n => n && n.type && n.type.name === "ChatInputButtons");
+      
+      if (buttons) {
+        const gifButton = findInReactTree(buttons, n => n && n.type?.name === "GIFButton");
         
-        if (buttons) {
-          const gifButton = findInReactTree(buttons, (n: any) => n && n.type?.name === "GIFButton");
+        if (gifButton) {
+          // Replace GIF button with sticker button
+          const originalOnPress = gifButton.props.onPress;
           
-          if (gifButton) {
-            // Replace GIF button with sticker button
-            const originalOnClick = gifButton.props.onPress;
+          gifButton.props.onPress = () => {
+            // Open Discord's sticker picker instead
+            const stickerId = getAssetIDByName("sticker");
+            gifButton.props.icon = stickerId;
             
-            gifButton.props.onPress = () => {
-              // Open Discord's sticker pic
+            // Use Discord's sticker picker open function
+            if (StickerPickerComponents?.openStickerPicker) {
+              StickerPickerComponents.openStickerPicker(args[0].channelId);
+            } else {
+              // Fallback
+              originalOnPress();
+            }
+          };
+          
+          // Change icon to sticker icon
+          gifButton.props.icon = getAssetIDByName("sticker") || gifButton.props.icon;
+        }
+      }
+      
+      return res;
+    })
+  );
+}
+
+function fetchAllStickers() {
+  if (StickerUtils?.fetchStickers) {
+    StickerUtils.fetchStickers().then(stickers => {
+      logger.log(`[${pluginName}] Fetched ${stickers.length} stickers`);
+      
+      // Cache stickers for quick access
+      stickers.forEach(sticker => {
+        stickerCache[sticker.id] = sticker;
+      });
+    }).catch(err => {
+      logger.error(`[${pluginName}] Error fetching stickers:`, err);
+    });
+  }
+}
+
+function registerStickerCommand() {
+  registerCommand({
+    name: "stickers",
+    displayName: "stickers",
+    description: "Open Discord sticker picker",
+    displayDescription: "Open Discord sticker picker",
+    type: ApplicationCommandType.CHAT,
+    options: [
+      {
+        name: "action",
+        displayName: "action",
+        description: "Action to perform",
+        displayDescription: "Action to perform",
+        type: ApplicationCommandOptionType.STRING,
+        choices: [
+          {
+            name: "open",
+            displayName: "open",
+            value: "open"
+          },
+          {
+            name: "refresh",
+            displayName: "refresh",
+            value: "refresh"
+          }
+        ],
+        required: true
+      }
+    ],
+    execute: (args, ctx) => {
+      const action = args[0].value;
+      
+      if (action === "open") {
+        // Open sticker picker
+        if (StickerPickerComponents?.openStickerPicker) {
+          StickerPickerComponents.openStickerPicker(ctx.channel.id);
+          return {
+            content: "Opening sticker picker..."
+          };
+        }
+      } else if (action === "refresh") {
+        // Refresh sticker cache
+        fetchAllStickers();
+        return {
+          content: "Refreshing sticker cache..."
+        };
+      }
+      
+      return {
+        content: "Failed to perform action"
+      };
+    }
+  });
+}
